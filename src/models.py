@@ -126,6 +126,9 @@ class RedditConfig(BaseModel):
     subreddits: List[RedditSubredditConfig] = Field(default_factory=list)
     users: List[RedditUserConfig] = Field(default_factory=list)
     fetch_comments: int = 5  # top comments per post, 0 to disable
+    client_id_env: str = ""
+    client_secret_env: str = ""
+    user_agent: str = "Horizon/1.0 (by u/horizon_bot)"
 
 
 class TelegramChannelConfig(BaseModel):

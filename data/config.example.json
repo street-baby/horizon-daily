@@ -74,7 +74,9 @@
           "fetch_limit": 10
         }
       ],
-      "fetch_comments": 5
+      "fetch_comments": 5,
+      "client_id_env": "REDDIT_CLIENT_ID",
+      "client_secret_env": "REDDIT_CLIENT_SECRET"
     },
     "twitter": {
       "enabled": false,
