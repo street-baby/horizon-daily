@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
+import feedparser
 import httpx
 
 from .base import BaseScraper
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 REDDIT_BASE = "https://www.reddit.com"
 REDDIT_OAUTH_BASE = "https://oauth.reddit.com"
+REDDIT_RSS_BASE = "https://www.reddit.com/r"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -38,6 +40,7 @@ class RedditScraper(BaseScraper):
         self.reddit_config = config
         self._comment_semaphore = asyncio.Semaphore(MAX_COMMENT_CONCURRENCY)
         self._oauth_token: Optional[str] = None
+        self._use_rss = False
 
     async def _ensure_oauth(self) -> bool:
         if self._oauth_token:
@@ -74,7 +77,9 @@ class RedditScraper(BaseScraper):
         if not self.config.get("enabled", True):
             return []
 
-        await self._ensure_oauth()
+        if not await self._ensure_oauth():
+            self._use_rss = True
+            logger.info("Reddit: no OAuth credentials, falling back to RSS feeds")
 
         tasks = []
         for sub_cfg in self.reddit_config.subreddits:
@@ -100,13 +105,58 @@ class RedditScraper(BaseScraper):
         return REDDIT_OAUTH_BASE if self._oauth_token else REDDIT_BASE
 
     async def _fetch_subreddit(self, cfg: RedditSubredditConfig, since: datetime) -> List[ContentItem]:
+        if self._use_rss:
+            return await self._fetch_subreddit_rss(cfg, since)
+        return await self._fetch_subreddit_api(cfg, since)
+
+    async def _fetch_user(self, cfg: RedditUserConfig, since: datetime) -> List[ContentItem]:
+        if self._use_rss:
+            logger.info("Reddit: user feed not available via RSS, skipping %s", cfg.username)
+            return []
+        return await self._fetch_user_api(cfg, since)
+
+    async def _fetch_subreddit_rss(self, cfg: RedditSubredditConfig, since: datetime) -> List[ContentItem]:
+        url = f"{REDDIT_RSS_BASE}/{cfg.subreddit}/.rss"
+        try:
+            resp = await self.client.get(url, headers=REDDIT_HEADERS, follow_redirects=True, timeout=15)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.text)
+        except Exception as e:
+            logger.warning("Reddit RSS failed for r/%s: %s", cfg.subreddit, e)
+            return []
+
+        items = []
+        for entry in feed.entries[:cfg.fetch_limit]:
+            published = entry.get("published_parsed") or entry.get("updated_parsed")
+            if not published:
+                continue
+            created = datetime(*published[:6], tzinfo=timezone.utc)
+            if created < since:
+                continue
+
+            link = entry.get("link", "")
+            content = entry.get("summary", entry.get("description", ""))
+            items.append(ContentItem(
+                id=self._generate_id("reddit", "subreddit", entry.get("id", link)),
+                source_type=SourceType.REDDIT,
+                title=entry.get("title", ""),
+                url=link,
+                content=content,
+                author=entry.get("author", "unknown"),
+                published_at=created,
+                metadata={"subreddit": cfg.subreddit, "score": 0, "num_comments": 0},
+            ))
+        logger.info("Reddit RSS: fetched %d items from r/%s", len(items), cfg.subreddit)
+        return items
+
+    async def _fetch_subreddit_api(self, cfg: RedditSubredditConfig, since: datetime) -> List[ContentItem]:
         params = {"limit": min(cfg.fetch_limit, 100), "raw_json": 1}
         if cfg.sort in ("top", "controversial"):
             params["t"] = cfg.time_filter
         if self._oauth_token:
             params["sr_detail"] = "true"
 
-        url = f"{self._base_url()}/r/{cfg.subreddit}/{cfg.sort}"
+        url = f"{REDDIT_BASE}/r/{cfg.subreddit}/{cfg.sort}.json"
         data = await self._reddit_get(url, params)
         if not data:
             return []
@@ -117,9 +167,9 @@ class RedditScraper(BaseScraper):
             posts, since, "subreddit", cfg.subreddit, cfg.min_score
         )
 
-    async def _fetch_user(self, cfg: RedditUserConfig, since: datetime) -> List[ContentItem]:
+    async def _fetch_user_api(self, cfg: RedditUserConfig, since: datetime) -> List[ContentItem]:
         params = {"limit": min(cfg.fetch_limit, 100), "sort": cfg.sort, "raw_json": 1}
-        url = f"{self._base_url()}/user/{cfg.username}/submitted"
+        url = f"{REDDIT_BASE}/user/{cfg.username}/submitted.json"
         data = await self._reddit_get(url, params)
         if not data:
             return []
